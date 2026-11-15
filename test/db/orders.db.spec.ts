@@ -167,6 +167,50 @@ describe('orders and balance', () => {
     });
   });
 
+  it('accepts the quantity bounds and lists lots oldest first', async () => {
+    const customerId = randomUUID();
+    const older = await service.placeOrder({
+      orderId: randomUUID(),
+      customerId,
+      quantity: 1,
+    });
+    const newer = await service.placeOrder({
+      orderId: randomUUID(),
+      customerId,
+      quantity: 1_000_000,
+    });
+    const balance = await service.getBalance(customerId);
+    const expected = [older, newer].sort(
+      (left, right) =>
+        left.placedAt.getTime() - right.placedAt.getTime() ||
+        left.id.localeCompare(right.id),
+    );
+
+    expect(balance.available).toBe(1_000_001);
+    expect(balance.orders.map((order) => order.id)).toEqual(
+      expected.map((order) => order.id),
+    );
+    expectConserved(balance);
+  });
+
+  it('replays a cancelled order without making it active again', async () => {
+    const customerId = randomUUID();
+    const orderId = randomUUID();
+    await service.placeOrder({ orderId, customerId, quantity: 3 });
+    await service.cancelOrder(orderId);
+
+    const replayed = await service.placeOrder({
+      orderId,
+      customerId,
+      quantity: 3,
+    });
+    const balance = await service.getBalance(customerId);
+
+    expect(replayed.status).toBe(OrderStatus.CANCELLED);
+    expect(balance.available).toBe(0);
+    expectConserved(balance);
+  });
+
   it('returns an empty balance for an unknown customer', async () => {
     const balance = await service.getBalance(randomUUID());
     expect(balance).toEqual({

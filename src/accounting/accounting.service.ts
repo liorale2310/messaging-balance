@@ -39,13 +39,6 @@ export class AccountingService {
   async placeOrder(input: PlaceOrderInput): Promise<OrderView> {
     assertQuantity(input.quantity);
     return this.dataSource.transaction('READ COMMITTED', async (manager) => {
-      const existing = await manager.findOne(Order, {
-        where: { id: input.orderId },
-      });
-      if (existing) {
-        return this.replayOrder(manager, existing, input);
-      }
-
       await manager.query(
         `INSERT INTO customers (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`,
         [input.customerId],
@@ -53,11 +46,11 @@ export class AccountingService {
       await this.lockCustomer(manager, input.customerId);
       await this.lockBooks(manager, input.customerId);
 
-      const raced = await manager.findOne(Order, {
+      const existing = await manager.findOne(Order, {
         where: { id: input.orderId },
       });
-      if (raced) {
-        return this.replayOrder(manager, raced, input);
+      if (existing) {
+        return this.replayOrder(manager, existing, input);
       }
 
       await manager.query('SAVEPOINT order_insert');
@@ -150,16 +143,8 @@ export class AccountingService {
     if (!sameOrderPayload(stored, input)) {
       throw orderConflict(input.orderId);
     }
-    await this.lockCustomer(manager, stored.customerId);
-    await this.lockBooks(manager, stored.customerId);
-    const current = await manager.findOne(Order, {
-      where: { id: stored.id },
-    });
-    if (!current || !sameOrderPayload(current, input)) {
-      throw orderConflict(input.orderId);
-    }
-    await this.assertCustomer(manager, current.customerId);
-    return toOrderView(current);
+    await this.assertCustomer(manager, stored.customerId);
+    return toOrderView(stored);
   }
 
   private async lockCustomer(
