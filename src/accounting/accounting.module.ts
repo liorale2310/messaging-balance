@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { AccountingService } from './accounting.service';
 import { Campaign } from './entities/campaign.entity';
 import { Customer } from './entities/customer.entity';
 import { HandoffEvent } from './entities/handoff-event.entity';
@@ -20,5 +21,7 @@ import { Reservation } from './entities/reservation.entity';
       HandoffEvent,
     ]),
   ],
+  providers: [AccountingService],
+  exports: [AccountingService],
 })
 export class AccountingModule {}
