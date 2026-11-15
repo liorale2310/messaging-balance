@@ -10,11 +10,28 @@ function requiredEnv(key: string): string {
   return value;
 }
 
+export function parseDatabasePort(value: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(
+      `Invalid DB_PORT: "${value}". Expected an integer between 1 and 65535.`,
+    );
+  }
+
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `Invalid DB_PORT: "${value}". Expected an integer between 1 and 65535.`,
+    );
+  }
+
+  return port;
+}
+
 export function createDatabaseOptions(): DataSourceOptions {
   return {
     type: 'postgres',
     host: requiredEnv('DB_HOST'),
-    port: parseInt(requiredEnv('DB_PORT'), 10),
+    port: parseDatabasePort(requiredEnv('DB_PORT')),
     username: requiredEnv('DB_USERNAME'),
     password: requiredEnv('DB_PASSWORD'),
     database: requiredEnv('DB_NAME'),
