@@ -53,7 +53,12 @@ describe('accounting schema', () => {
     await ds.query(
       `INSERT INTO orders (id, customer_id, quantity, status, placed_at, cancelled_at)
        VALUES ($1, $2, 1, 'CANCELLED', $3, $4)`,
-      [cancelledOrderId, customerId, placedAt, new Date('2026-01-02T00:00:00.000Z')],
+      [
+        cancelledOrderId,
+        customerId,
+        placedAt,
+        new Date('2026-01-02T00:00:00.000Z'),
+      ],
     );
     await ds.query(
       `INSERT INTO campaigns (id, customer_id, status) VALUES ($1, $2, 'DRAFT')`,
@@ -86,7 +91,14 @@ describe('accounting schema', () => {
       `INSERT INTO messages (
          id, campaign_id, recipient_id, address, order_id, outcome, credit_state, outcome_sequence
        ) VALUES ($1, $2, $3, $4, $5, 'ACCEPTED', 'CONSUMED', $6::bigint)`,
-      [messageId, dispatchedId, recipientId, '+15551212', orderId, ABOVE_SAFE_INTEGER],
+      [
+        messageId,
+        dispatchedId,
+        recipientId,
+        '+15551212',
+        orderId,
+        ABOVE_SAFE_INTEGER,
+      ],
     );
     await ds.query(
       `INSERT INTO messages (
@@ -100,7 +112,9 @@ describe('accounting schema', () => {
       ['evt-1', messageId, ABOVE_SAFE_INTEGER],
     );
 
-    const message = await ds.getRepository(Message).findOneByOrFail({ id: messageId });
+    const message = await ds
+      .getRepository(Message)
+      .findOneByOrFail({ id: messageId });
     expect(message.outcomeSequence).toBe(BigInt(ABOVE_SAFE_INTEGER));
     expect(typeof message.outcomeSequence).toBe('bigint');
 
@@ -110,15 +124,39 @@ describe('accounting schema', () => {
     expect(unbacked.orderId).toBeNull();
     expect(unbacked.outcomeSequence).toBeNull();
 
-    const bigintColumns: Array<{ table_name: string; column_name: string }> = await ds.query(
-      `SELECT table_name, column_name
+    const bigintColumns: Array<{ table_name: string; column_name: string }> =
+      await ds.query(
+        `SELECT table_name, column_name
        FROM information_schema.columns
-       WHERE table_schema = 'public' AND data_type = 'bigint'
+       WHERE table_schema = 'public'
+         AND data_type = 'bigint'
+         AND table_name <> 'migrations'
        ORDER BY table_name, column_name`,
-    );
+      );
     expect(bigintColumns).toEqual([
       { table_name: 'handoff_events', column_name: 'sequence' },
       { table_name: 'messages', column_name: 'outcome_sequence' },
+    ]);
+
+    const checks: Array<{ conname: string }> = await ds.query(
+      `SELECT conname
+       FROM pg_constraint
+       WHERE contype = 'c' AND conname LIKE 'CHK_%'
+       ORDER BY conname`,
+    );
+    expect(checks.map((check) => check.conname)).toEqual([
+      'CHK_campaigns_schedule_state',
+      'CHK_campaigns_status',
+      'CHK_handoff_events_event_id',
+      'CHK_handoff_events_outcome',
+      'CHK_handoff_events_sequence',
+      'CHK_messages_address',
+      'CHK_messages_outcome_pair',
+      'CHK_orders_cancel_pair',
+      'CHK_orders_quantity',
+      'CHK_orders_status',
+      'CHK_recipients_address',
+      'CHK_reservations_quantity',
     ]);
   });
 
@@ -168,7 +206,6 @@ describe('accounting schema', () => {
           [randomUUID(), customerId],
         ),
       '23514',
-      'CHK_orders_status',
     );
   });
 
@@ -243,7 +280,6 @@ describe('accounting schema', () => {
           [randomUUID(), customerId],
         ),
       '23514',
-      'CHK_campaigns_status',
     );
   });
 
@@ -361,26 +397,28 @@ describe('accounting schema', () => {
       sequence: string | null,
     ) => {
       const recipientId = randomUUID();
-      return ds.query(
-        `INSERT INTO recipients (id, campaign_id, address) VALUES ($1, $2, $3)`,
-        [recipientId, campaignId, recipientId],
-      ).then(() =>
-        ds.query(
-          `INSERT INTO messages (
+      return ds
+        .query(
+          `INSERT INTO recipients (id, campaign_id, address) VALUES ($1, $2, $3)`,
+          [recipientId, campaignId, recipientId],
+        )
+        .then(() =>
+          ds.query(
+            `INSERT INTO messages (
              id, campaign_id, recipient_id, address, order_id, outcome, credit_state, outcome_sequence
            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::bigint)`,
-          [
-            randomUUID(),
-            campaignId,
-            recipientId,
-            recipientId.slice(0, 64),
-            orderId,
-            outcome,
-            creditState,
-            sequence,
-          ],
-        ),
-      );
+            [
+              randomUUID(),
+              campaignId,
+              recipientId,
+              recipientId.slice(0, 64),
+              orderId,
+              outcome,
+              creditState,
+              sequence,
+            ],
+          ),
+        );
     };
 
     await insertMessage('PENDING', 'RESERVED', null);
@@ -434,15 +472,21 @@ describe('accounting schema', () => {
         ),
       '23505',
     );
+    const blankRecipientId = randomUUID();
+    await ds.query(
+      `INSERT INTO recipients (id, campaign_id, address) VALUES ($1, $2, 'kept')`,
+      [blankRecipientId, campaignId],
+    );
     await expectDbError(
       () =>
         ds.query(
           `INSERT INTO messages (
              id, campaign_id, recipient_id, address, outcome, credit_state
            ) VALUES ($1, $2, $3, '   ', 'PENDING', 'RESERVED')`,
-          [randomUUID(), campaignId, randomUUID()],
+          [randomUUID(), campaignId, blankRecipientId],
         ),
-      '23503',
+      '23514',
+      'CHK_messages_address',
     );
   });
 
