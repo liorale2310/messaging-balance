@@ -7,7 +7,7 @@ todos:
     status: completed
   - id: pr2-orders
     content: "Task 2 of the same run, with no new user prompt: branch feat/orders-and-balance from feat/accounting-schema. placeOrder, cancelOrder, getBalance, conservation assertion, and order integration tests. Full suite, review, commit, push, and open the PR against feat/accounting-schema."
-    status: pending
+    status: completed
   - id: pr3-campaigns
     content: "Task 3 of the same run, with no new user prompt: branch feat/campaign-reservations from feat/orders-and-balance. Campaigns, recipients, schedule, cancel schedule, FIFO reservations, cancellation shortfall, insufficient credit, and concurrent scheduling tests. Full suite, review, commit, push, and open the PR against feat/orders-and-balance."
     status: pending
@@ -265,7 +265,7 @@ The orchestrator updates this table and the YAML `todos` together. `completed` m
 | Task | Branch | PR base | Commits | PR | Validation | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 Schema | `feat/accounting-schema` | `main` | `bb0f092`, `5161379`, `f400f47` (head `f400f47`, base `1aae9dd`) | https://github.com/liorale2310/messaging-balance/pull/2 | `npm run build` pass; `npm run lint` pass with the existing `src/main.ts` floating-promise warning; `npm test` 10 passed; `DB_NAME=messaging_balance_test npm run test:db` 8 passed | completed |
-| 2 Orders | `feat/orders-and-balance` | `feat/accounting-schema` | — | — | — | pending |
+| 2 Orders | `feat/orders-and-balance` | `feat/accounting-schema` | `4dfc19d`, `b051280` (head `b051280`, base `671f012`) | https://github.com/liorale2310/messaging-balance/pull/3 | `npm run build` pass; `npm run lint` pass with the existing `src/main.ts` floating-promise warning; `npm test` 13 passed; `DB_NAME=messaging_balance_test npm run test:db` 17 passed | completed |
 | 3 Campaigns | `feat/campaign-reservations` | `feat/orders-and-balance` | — | — | — | pending |
 | 4 Send | `feat/send-and-handoff` | `feat/campaign-reservations` | — | — | — | pending |
 
