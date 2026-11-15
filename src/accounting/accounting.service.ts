@@ -1,9 +1,7 @@
-import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { AccountingError } from './accounting.errors';
 import { allocateFifo, coverOutstanding } from './domain/allocation.policy';
-import { decideHandoff, HandoffReport } from './domain/handoff.policy';
 import {
   Balance,
   Books,
@@ -13,11 +11,7 @@ import {
 } from './domain/balance.projection';
 import { Campaign, CampaignStatus } from './entities/campaign.entity';
 import { Customer } from './entities/customer.entity';
-import {
-  CreditState,
-  Message,
-  MessageOutcome,
-} from './entities/message.entity';
+import { CreditState, Message } from './entities/message.entity';
 import { Order, OrderStatus } from './entities/order.entity';
 import { Recipient } from './entities/recipient.entity';
 import { Reservation } from './entities/reservation.entity';
@@ -43,18 +37,6 @@ export interface RecipientView {
   id: string;
   campaignId: string;
   address: string;
-}
-
-export interface SendDueResult {
-  dispatched: string[];
-  notSent: string[];
-}
-
-export interface HandoffInput {
-  eventId: string;
-  messageId: string;
-  outcome: 'ACCEPTED' | 'REJECTED';
-  sequence: bigint;
 }
 
 export interface OrderView {
@@ -454,94 +436,6 @@ export class AccountingService {
     });
   }
 
-  async sendDue(at: Date): Promise<SendDueResult> {
-    if (!(at instanceof Date) || Number.isNaN(at.getTime())) {
-      return { dispatched: [], notSent: [] };
-    }
-    const customers = await this.dataSource.query<{ customerId: string }[]>(
-      `SELECT DISTINCT customer_id AS "customerId"
-       FROM campaigns
-       WHERE status = 'SCHEDULED' AND scheduled_at <= $1
-       ORDER BY customer_id`,
-      [at],
-    );
-    const dispatched: string[] = [];
-    const notSent: string[] = [];
-    for (const customer of customers) {
-      const result = await this.sendCustomerDue(customer.customerId, at);
-      dispatched.push(...result.dispatched);
-      notSent.push(...result.notSent);
-    }
-    return { dispatched, notSent };
-  }
-
-  async recordHandoff(input: HandoffInput): Promise<void> {
-    const report = handoffReport(input);
-    const message = await this.dataSource.getRepository(Message).findOne({
-      where: { id: report.messageId },
-    });
-    if (!message) {
-      throw new AccountingError(
-        'MESSAGE_NOT_FOUND',
-        `Message ${report.messageId} was not found.`,
-      );
-    }
-    const campaign = await this.requireCampaign(message.campaignId);
-    await this.dataSource.transaction('READ COMMITTED', async (manager) => {
-      await this.lockCustomer(manager, campaign.customerId);
-      await this.lockBooks(manager, campaign.customerId);
-      const current = await manager.findOne(Message, {
-        where: { id: report.messageId },
-      });
-      if (!current) {
-        throw new AccountingError(
-          'MESSAGE_NOT_FOUND',
-          `Message ${report.messageId} was not found.`,
-        );
-      }
-      const decision = decideHandoff({
-        incoming: report,
-        storedByEventId: await this.findHandoff(manager, report.eventId),
-        sequenceTaken: await this.sequenceTaken(
-          manager,
-          report.messageId,
-          report.sequence,
-        ),
-        appliedSequence: current.outcomeSequence,
-      });
-      if (decision.kind === 'conflict') {
-        throw handoffConflict(report.eventId);
-      }
-      if (decision.kind === 'idempotent') {
-        await this.settle(manager, campaign.customerId);
-        return;
-      }
-      const inserted = await this.insertHandoff(manager, report);
-      if (!inserted) {
-        const raced = decideHandoff({
-          incoming: report,
-          storedByEventId: await this.findHandoff(manager, report.eventId),
-          sequenceTaken: await this.sequenceTaken(
-            manager,
-            report.messageId,
-            report.sequence,
-          ),
-          appliedSequence: current.outcomeSequence,
-        });
-        if (raced.kind === 'idempotent') {
-          await this.settle(manager, campaign.customerId);
-          return;
-        }
-        throw handoffConflict(report.eventId);
-      }
-      if (decision.kind === 'apply') {
-        await this.applyHandoff(manager, campaign.customerId, current, report);
-        return;
-      }
-      await this.settle(manager, campaign.customerId);
-    });
-  }
-
   async getBalance(customerId: string): Promise<Balance> {
     const customer = await this.dataSource.getRepository(Customer).findOne({
       where: { id: customerId },
@@ -720,230 +614,6 @@ export class AccountingService {
       { campaignId, orderId: newest.orderId },
       { quantity: newest.quantity - 1 },
     );
-  }
-
-  private async sendCustomerDue(
-    customerId: string,
-    at: Date,
-  ): Promise<SendDueResult> {
-    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
-      await this.lockCustomer(manager, customerId);
-      await this.lockBooks(manager, customerId);
-      const due = await manager
-        .createQueryBuilder(Campaign, 'campaign')
-        .setLock('pessimistic_write')
-        .where('campaign.customerId = :customerId', { customerId })
-        .andWhere('campaign.status = :status', {
-          status: CampaignStatus.SCHEDULED,
-        })
-        .andWhere('campaign.scheduledAt <= :at', { at })
-        .orderBy('campaign.scheduledAt', 'ASC')
-        .addOrderBy('campaign.id', 'ASC')
-        .getMany();
-      const dispatched: string[] = [];
-      const notSent: string[] = [];
-      for (const campaign of due) {
-        const books = await this.loadBooks(manager, customerId);
-        const projected = projectBalance(books).campaigns.find(
-          (item) => item.id === campaign.id,
-        );
-        const funded = projected?.funded ?? 0;
-        const recipientCount = projected?.recipientCount ?? 0;
-        if (recipientCount > 0 && funded === recipientCount) {
-          await this.dispatchCampaign(manager, books, campaign.id);
-          dispatched.push(campaign.id);
-        } else {
-          await this.markNotSent(manager, campaign, funded, recipientCount);
-          await this.coverCustomer(manager, customerId);
-          notSent.push(campaign.id);
-        }
-      }
-      await this.settle(manager, customerId);
-      return { dispatched, notSent };
-    });
-  }
-
-  private async dispatchCampaign(
-    manager: EntityManager,
-    books: Books,
-    campaignId: string,
-  ): Promise<void> {
-    const recipients = await manager.find(Recipient, {
-      where: { campaignId },
-      order: { createdAt: 'ASC', id: 'ASC' },
-    });
-    const ordersById = new Map(books.orders.map((order) => [order.id, order]));
-    const credits: string[] = [];
-    const lots = books.reservations
-      .filter((reservation) => reservation.campaignId === campaignId)
-      .slice()
-      .sort((left, right) => {
-        const leftPlaced =
-          ordersById.get(left.orderId)?.placedAt.getTime() ?? 0;
-        const rightPlaced =
-          ordersById.get(right.orderId)?.placedAt.getTime() ?? 0;
-        return (
-          leftPlaced - rightPlaced || left.orderId.localeCompare(right.orderId)
-        );
-      });
-    for (const lot of lots) {
-      for (let index = 0; index < lot.quantity; index += 1) {
-        credits.push(lot.orderId);
-      }
-    }
-    if (credits.length !== recipients.length) {
-      throw new Error(
-        `Campaign ${campaignId} is funded on the balance but its reservations do not match its recipients.`,
-      );
-    }
-    for (const [index, recipient] of recipients.entries()) {
-      await manager.insert(Message, {
-        id: randomUUID(),
-        campaignId,
-        recipientId: recipient.id,
-        address: recipient.address,
-        orderId: credits[index],
-        outcome: MessageOutcome.PENDING,
-        creditState: CreditState.RESERVED,
-        outcomeSequence: null,
-      });
-    }
-    await manager.delete(Reservation, { campaignId });
-    await manager.update(Campaign, campaignId, {
-      status: CampaignStatus.DISPATCHED,
-      fundingNote: null,
-    });
-  }
-
-  private async markNotSent(
-    manager: EntityManager,
-    campaign: Campaign,
-    funded: number,
-    recipientCount: number,
-  ): Promise<void> {
-    const reason = [
-      `Not sent: ${funded} of ${recipientCount} recipients were funded.`,
-      campaign.fundingNote,
-    ]
-      .filter((part): part is string => part !== null && part !== '')
-      .join(' ');
-    await manager.delete(Reservation, { campaignId: campaign.id });
-    await manager.update(Campaign, campaign.id, {
-      status: CampaignStatus.NOT_SENT,
-      notSentReason: reason,
-    });
-  }
-
-  private async applyHandoff(
-    manager: EntityManager,
-    customerId: string,
-    message: Message,
-    report: HandoffReport,
-  ): Promise<void> {
-    const books = await this.loadBooks(manager, customerId);
-    const activeIds = new Set(
-      books.orders
-        .filter((order) => order.status === OrderStatus.ACTIVE)
-        .map((order) => order.id),
-    );
-    const held =
-      message.creditState === CreditState.RESERVED &&
-      message.orderId !== null &&
-      activeIds.has(message.orderId);
-    if (report.outcome === 'ACCEPTED') {
-      await manager.query(
-        `UPDATE messages
-         SET outcome = 'ACCEPTED',
-             credit_state = 'CONSUMED',
-             outcome_sequence = $1::bigint,
-             order_id = $2
-         WHERE id = $3`,
-        [report.sequence.toString(), held ? message.orderId : null, message.id],
-      );
-    } else {
-      await manager.query(
-        `UPDATE messages
-         SET outcome = 'REJECTED',
-             credit_state = 'RELEASED',
-             outcome_sequence = $1::bigint,
-             order_id = NULL
-         WHERE id = $2`,
-        [report.sequence.toString(), message.id],
-      );
-    }
-    await this.settle(manager, customerId);
-  }
-
-  private async findHandoff(
-    manager: EntityManager,
-    eventId: string,
-  ): Promise<HandoffReport | null> {
-    const rows = await manager.query<
-      {
-        eventId: string;
-        messageId: string;
-        outcome: 'ACCEPTED' | 'REJECTED';
-        sequence: string;
-      }[]
-    >(
-      `SELECT event_id AS "eventId",
-              message_id AS "messageId",
-              outcome,
-              sequence::text AS sequence
-       FROM handoff_events
-       WHERE event_id = $1`,
-      [eventId],
-    );
-    const row = rows[0];
-    if (!row) {
-      return null;
-    }
-    return {
-      eventId: row.eventId,
-      messageId: row.messageId,
-      outcome: row.outcome,
-      sequence: BigInt(row.sequence),
-    };
-  }
-
-  private async sequenceTaken(
-    manager: EntityManager,
-    messageId: string,
-    sequence: bigint,
-  ): Promise<boolean> {
-    const rows = await manager.query<unknown[]>(
-      `SELECT 1 FROM handoff_events
-       WHERE message_id = $1 AND sequence = $2::bigint`,
-      [messageId, sequence.toString()],
-    );
-    return rows.length > 0;
-  }
-
-  private async insertHandoff(
-    manager: EntityManager,
-    report: HandoffReport,
-  ): Promise<boolean> {
-    await manager.query('SAVEPOINT handoff_insert');
-    try {
-      await manager.query(
-        `INSERT INTO handoff_events (event_id, message_id, outcome, sequence)
-         VALUES ($1, $2, $3, $4::bigint)`,
-        [
-          report.eventId,
-          report.messageId,
-          report.outcome,
-          report.sequence.toString(),
-        ],
-      );
-      await manager.query('RELEASE SAVEPOINT handoff_insert');
-      return true;
-    } catch (error) {
-      if (!isUniqueViolation(error)) {
-        throw error;
-      }
-      await manager.query('ROLLBACK TO SAVEPOINT handoff_insert');
-      return false;
-    }
   }
 
   private async settle(
@@ -1204,34 +874,6 @@ function toOrderView(order: Order): OrderView {
     placedAt: order.placedAt,
     cancelledAt: order.cancelledAt,
   };
-}
-
-function handoffReport(input: HandoffInput): HandoffReport {
-  if (
-    typeof input.eventId !== 'string' ||
-    input.eventId.length === 0 ||
-    (input.outcome !== 'ACCEPTED' && input.outcome !== 'REJECTED') ||
-    typeof input.sequence !== 'bigint' ||
-    input.sequence <= 0n
-  ) {
-    throw new AccountingError(
-      'HANDOFF_CONFLICT',
-      'A handoff report needs a non-empty event id, an accepted or rejected outcome, and a positive sequence.',
-    );
-  }
-  return {
-    eventId: input.eventId,
-    messageId: input.messageId,
-    outcome: input.outcome,
-    sequence: input.sequence,
-  };
-}
-
-function handoffConflict(eventId: string): AccountingError {
-  return new AccountingError(
-    'HANDOFF_CONFLICT',
-    `Handoff event ${eventId} conflicts with a report already stored.`,
-  );
 }
 
 function isUniqueViolation(error: unknown): boolean {
