@@ -51,6 +51,15 @@ DB_NAME=messaging_balance_test npm run test:db
 
 The database test runner applies migrations in global setup and truncates the accounting tables between cases. The `_test` suffix is what keeps that truncate off the development database.
 
+## Code map
+
+`AccountingService` is the only transaction boundary. Each use case locks the customer first, then that customer's orders, campaigns, and messages, writes the change, and checks that credit still adds up before the transaction commits.
+
+- `src/accounting/domain/allocation.policy.ts` splits free credit oldest-first and covers unbacked in-flight messages, then the earliest scheduled shortfall, then the oldest debt.
+- `src/accounting/domain/handoff.policy.ts` decides whether a dispatcher report is a replay, a conflict, a stored older sequence, or the result to apply. Sequences are `bigint`.
+- `src/accounting/domain/balance.projection.ts` reads the current rows into available, reserved, consumed, debt, and the sentences returned with the balance.
+- `src/accounting/entities` is the schema. `src/migrations` is the only way that schema changes.
+
 ## Build
 
 ```bash
