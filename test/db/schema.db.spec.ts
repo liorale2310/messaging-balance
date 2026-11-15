@@ -359,7 +359,7 @@ describe('accounting schema', () => {
       () =>
         ds.query(
           `INSERT INTO reservations (campaign_id, order_id, quantity) VALUES ($1, $2, 0)`,
-          [campaignId, randomUUID()],
+          [campaignId, orderId],
         ),
       '23514',
       'CHK_reservations_quantity',
