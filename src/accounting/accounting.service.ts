@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { AccountingError } from './accounting.errors';
+import { allocateFifo, coverOutstanding } from './domain/allocation.policy';
 import {
   Balance,
   Books,
@@ -8,9 +9,9 @@ import {
   emptyBalance,
   projectBalance,
 } from './domain/balance.projection';
-import { Campaign } from './entities/campaign.entity';
+import { Campaign, CampaignStatus } from './entities/campaign.entity';
 import { Customer } from './entities/customer.entity';
-import { Message } from './entities/message.entity';
+import { CreditState, Message } from './entities/message.entity';
 import { Order, OrderStatus } from './entities/order.entity';
 import { Recipient } from './entities/recipient.entity';
 import { Reservation } from './entities/reservation.entity';
@@ -21,6 +22,21 @@ export interface PlaceOrderInput {
   orderId: string;
   customerId: string;
   quantity: number;
+}
+
+export interface CampaignView {
+  id: string;
+  customerId: string;
+  status: CampaignStatus;
+  scheduledAt: Date | null;
+  fundingNote: string | null;
+  notSentReason: string | null;
+}
+
+export interface RecipientView {
+  id: string;
+  campaignId: string;
+  address: string;
 }
 
 export interface OrderView {
@@ -78,7 +94,7 @@ export class AccountingService {
         return this.replayOrder(manager, stored, input);
       }
 
-      await this.assertCustomer(manager, input.customerId);
+      await this.settle(manager, input.customerId);
       const stored = await manager.findOneOrFail(Order, {
         where: { id: input.orderId },
       });
@@ -114,9 +130,309 @@ export class AccountingService {
           status: order.status,
           cancelledAt: order.cancelledAt,
         });
+        await manager.delete(Reservation, { orderId: order.id });
+        await manager
+          .createQueryBuilder()
+          .update(Message)
+          .set({ orderId: null })
+          .where('order_id = :orderId', { orderId: order.id })
+          .andWhere('credit_state = :creditState', {
+            creditState: CreditState.RESERVED,
+          })
+          .execute();
+        await this.settle(manager, order.customerId, {
+          cancelledOrderId: order.id,
+        });
+      } else {
+        await this.settle(manager, order.customerId);
       }
-      await this.assertCustomer(manager, order.customerId);
       return toOrderView(order);
+    });
+  }
+
+  async createCampaign(input: {
+    campaignId: string;
+    customerId: string;
+  }): Promise<CampaignView> {
+    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      const existing = await manager.findOne(Campaign, {
+        where: { id: input.campaignId },
+      });
+      if (existing) {
+        if (existing.customerId !== input.customerId) {
+          throw new AccountingError(
+            'CAMPAIGN_CONFLICT',
+            `Campaign ${input.campaignId} already exists for another customer.`,
+          );
+        }
+        await this.lockCustomer(manager, existing.customerId);
+        await this.lockBooks(manager, existing.customerId);
+        await this.settle(manager, existing.customerId);
+        return toCampaignView(existing);
+      }
+
+      await this.ensureCustomer(manager, input.customerId);
+      await this.lockCustomer(manager, input.customerId);
+      await this.lockBooks(manager, input.customerId);
+      const raced = await manager.findOne(Campaign, {
+        where: { id: input.campaignId },
+      });
+      if (raced) {
+        if (raced.customerId !== input.customerId) {
+          throw new AccountingError(
+            'CAMPAIGN_CONFLICT',
+            `Campaign ${input.campaignId} already exists for another customer.`,
+          );
+        }
+        await this.settle(manager, input.customerId);
+        return toCampaignView(raced);
+      }
+
+      await manager.query('SAVEPOINT campaign_insert');
+      try {
+        await manager.insert(Campaign, {
+          id: input.campaignId,
+          customerId: input.customerId,
+          status: CampaignStatus.DRAFT,
+          scheduledAt: null,
+          fundingNote: null,
+          notSentReason: null,
+        });
+        await manager.query('RELEASE SAVEPOINT campaign_insert');
+      } catch (error) {
+        await manager.query('ROLLBACK TO SAVEPOINT campaign_insert');
+        if (!isUniqueViolation(error)) {
+          throw error;
+        }
+        const stored = await manager.findOne(Campaign, {
+          where: { id: input.campaignId },
+        });
+        if (!stored || stored.customerId !== input.customerId) {
+          throw new AccountingError(
+            'CAMPAIGN_CONFLICT',
+            `Campaign ${input.campaignId} already exists for another customer.`,
+          );
+        }
+        await this.settle(manager, input.customerId);
+        return toCampaignView(stored);
+      }
+
+      await this.settle(manager, input.customerId);
+      return toCampaignView(
+        await manager.findOneOrFail(Campaign, {
+          where: { id: input.campaignId },
+        }),
+      );
+    });
+  }
+
+  async addRecipient(input: {
+    campaignId: string;
+    recipientId: string;
+    address: string;
+  }): Promise<RecipientView> {
+    const address = input.address.trim();
+    if (address.length === 0 || address.length > 64) {
+      throw new AccountingError(
+        'CAMPAIGN_CONFLICT',
+        'Recipient address must be a trimmed non-empty string of at most 64 characters.',
+      );
+    }
+    const campaign = await this.requireCampaign(input.campaignId);
+    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      await this.lockCustomer(manager, campaign.customerId);
+      await this.lockBooks(manager, campaign.customerId);
+      const current = await this.requireCampaignIn(
+        manager,
+        input.campaignId,
+        campaign.customerId,
+      );
+      this.assertEditable(current, 'Recipients');
+      const sameId = await manager.findOne(Recipient, {
+        where: { id: input.recipientId },
+      });
+      if (sameId) {
+        if (sameId.campaignId === current.id && sameId.address === address) {
+          await this.settle(manager, current.customerId);
+          return toRecipientView(sameId);
+        }
+        throw new AccountingError(
+          'CAMPAIGN_CONFLICT',
+          `Recipient ${input.recipientId} already exists with a different address.`,
+        );
+      }
+      const duplicate = await manager.findOne(Recipient, {
+        where: { campaignId: current.id, address },
+      });
+      if (duplicate) {
+        throw new AccountingError(
+          'DUPLICATE_RECIPIENT',
+          `Campaign ${current.id} already includes ${address}.`,
+        );
+      }
+
+      if (current.status === CampaignStatus.SCHEDULED) {
+        const books = await this.loadBooks(manager, current.customerId);
+        const balance = projectBalance(books);
+        const allocation = allocateFifo(freeLots(balance), 1);
+        if (balance.available < 1 || allocation.uncovered > 0) {
+          throw insufficientCredit(balance);
+        }
+        await manager.insert(Recipient, {
+          id: input.recipientId,
+          campaignId: current.id,
+          address,
+        });
+        await this.addReservationPieces(manager, current.id, allocation.pieces);
+      } else {
+        await manager.insert(Recipient, {
+          id: input.recipientId,
+          campaignId: current.id,
+          address,
+        });
+      }
+
+      await this.settle(manager, current.customerId);
+      return toRecipientView(
+        await manager.findOneOrFail(Recipient, {
+          where: { id: input.recipientId },
+        }),
+      );
+    });
+  }
+
+  async removeRecipient(input: {
+    campaignId: string;
+    recipientId: string;
+  }): Promise<void> {
+    const campaign = await this.requireCampaign(input.campaignId);
+    await this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      await this.lockCustomer(manager, campaign.customerId);
+      await this.lockBooks(manager, campaign.customerId);
+      const current = await this.requireCampaignIn(
+        manager,
+        input.campaignId,
+        campaign.customerId,
+      );
+      this.assertEditable(current, 'Recipients');
+      const recipient = await manager.findOne(Recipient, {
+        where: { id: input.recipientId, campaignId: current.id },
+      });
+      if (!recipient) {
+        throw new AccountingError(
+          'RECIPIENT_NOT_FOUND',
+          `Recipient ${input.recipientId} was not found on campaign ${current.id}.`,
+        );
+      }
+      if (current.status === CampaignStatus.SCHEDULED) {
+        const books = await this.loadBooks(manager, current.customerId);
+        const shortfall =
+          projectBalance(books).campaigns.find((item) => item.id === current.id)
+            ?.shortfall ?? 0;
+        if (shortfall === 0) {
+          await this.releaseNewestCredit(manager, books, current.id);
+        }
+      }
+      await manager.delete(Recipient, recipient.id);
+      await this.settle(manager, current.customerId);
+    });
+  }
+
+  async scheduleCampaign(input: {
+    campaignId: string;
+    scheduledAt: Date;
+  }): Promise<CampaignView> {
+    if (
+      !(input.scheduledAt instanceof Date) ||
+      Number.isNaN(input.scheduledAt.getTime())
+    ) {
+      throw new AccountingError(
+        'SCHEDULE_CONFLICT',
+        'Scheduled time is not a valid date.',
+      );
+    }
+    const campaign = await this.requireCampaign(input.campaignId);
+    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      await this.lockCustomer(manager, campaign.customerId);
+      await this.lockBooks(manager, campaign.customerId);
+      const current = await this.requireCampaignIn(
+        manager,
+        input.campaignId,
+        campaign.customerId,
+      );
+      if (
+        current.status === CampaignStatus.SCHEDULED &&
+        current.scheduledAt?.getTime() === input.scheduledAt.getTime()
+      ) {
+        await this.settle(manager, current.customerId);
+        return toCampaignView(current);
+      }
+      if (current.status === CampaignStatus.SCHEDULED) {
+        throw new AccountingError(
+          'SCHEDULE_CONFLICT',
+          `Campaign ${current.id} is already scheduled. Cancel the schedule before choosing another time.`,
+        );
+      }
+      if (current.status !== CampaignStatus.DRAFT) {
+        throw new AccountingError(
+          'CAMPAIGN_NOT_EDITABLE',
+          `Campaign ${current.id} cannot be scheduled from ${current.status}.`,
+        );
+      }
+      const books = await this.loadBooks(manager, current.customerId);
+      const recipientCount =
+        books.campaigns.find((item) => item.id === current.id)
+          ?.recipientCount ?? 0;
+      if (recipientCount === 0) {
+        throw new AccountingError(
+          'EMPTY_CAMPAIGN',
+          `Campaign ${current.id} has no recipients.`,
+        );
+      }
+      const balance = projectBalance(books);
+      const allocation = allocateFifo(freeLots(balance), recipientCount);
+      if (balance.available < recipientCount || allocation.uncovered > 0) {
+        throw insufficientCredit(balance);
+      }
+      await this.addReservationPieces(manager, current.id, allocation.pieces);
+      await manager.update(Campaign, current.id, {
+        status: CampaignStatus.SCHEDULED,
+        scheduledAt: input.scheduledAt,
+        fundingNote: null,
+      });
+      await this.settle(manager, current.customerId);
+      return toCampaignView(
+        await manager.findOneOrFail(Campaign, { where: { id: current.id } }),
+      );
+    });
+  }
+
+  async cancelSchedule(campaignId: string): Promise<CampaignView> {
+    const campaign = await this.requireCampaign(campaignId);
+    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      await this.lockCustomer(manager, campaign.customerId);
+      await this.lockBooks(manager, campaign.customerId);
+      const current = await this.requireCampaignIn(
+        manager,
+        campaignId,
+        campaign.customerId,
+      );
+      if (current.status !== CampaignStatus.SCHEDULED) {
+        throw new AccountingError(
+          'CAMPAIGN_NOT_EDITABLE',
+          `Campaign ${current.id} is ${current.status} and has no schedule to cancel.`,
+        );
+      }
+      await manager.delete(Reservation, { campaignId: current.id });
+      await manager.update(Campaign, current.id, {
+        status: CampaignStatus.DRAFT,
+        scheduledAt: null,
+        fundingNote: null,
+      });
+      await this.settle(manager, current.customerId);
+      return toCampaignView(
+        await manager.findOneOrFail(Campaign, { where: { id: current.id } }),
+      );
     });
   }
 
@@ -143,7 +459,7 @@ export class AccountingService {
     if (!sameOrderPayload(stored, input)) {
       throw orderConflict(input.orderId);
     }
-    await this.assertCustomer(manager, stored.customerId);
+    await this.settle(manager, stored.customerId);
     return toOrderView(stored);
   }
 
@@ -189,11 +505,231 @@ export class AccountingService {
       .getMany();
   }
 
-  private async assertCustomer(
+  private async requireCampaign(campaignId: string): Promise<Campaign> {
+    const campaign = await this.dataSource.getRepository(Campaign).findOne({
+      where: { id: campaignId },
+    });
+    if (!campaign) {
+      throw new AccountingError(
+        'CAMPAIGN_NOT_FOUND',
+        `Campaign ${campaignId} was not found.`,
+      );
+    }
+    return campaign;
+  }
+
+  private async requireCampaignIn(
+    manager: EntityManager,
+    campaignId: string,
+    customerId: string,
+  ): Promise<Campaign> {
+    const campaign = await manager.findOne(Campaign, {
+      where: { id: campaignId },
+    });
+    if (!campaign || campaign.customerId !== customerId) {
+      throw new AccountingError(
+        'CAMPAIGN_NOT_FOUND',
+        `Campaign ${campaignId} was not found.`,
+      );
+    }
+    return campaign;
+  }
+
+  private assertEditable(campaign: Campaign, action: string): void {
+    if (
+      campaign.status === CampaignStatus.DISPATCHED ||
+      campaign.status === CampaignStatus.NOT_SENT
+    ) {
+      throw new AccountingError(
+        'CAMPAIGN_NOT_EDITABLE',
+        `${action} cannot change campaign ${campaign.id} after it is ${campaign.status}.`,
+      );
+    }
+  }
+
+  private async ensureCustomer(
     manager: EntityManager,
     customerId: string,
   ): Promise<void> {
+    await manager.query(
+      `INSERT INTO customers (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`,
+      [customerId],
+    );
+  }
+
+  private async addReservationPieces(
+    manager: EntityManager,
+    campaignId: string,
+    pieces: { orderId: string; quantity: number }[],
+  ): Promise<void> {
+    for (const piece of pieces) {
+      const current = await manager.findOne(Reservation, {
+        where: { campaignId, orderId: piece.orderId },
+      });
+      if (current) {
+        await manager.update(
+          Reservation,
+          { campaignId, orderId: piece.orderId },
+          { quantity: current.quantity + piece.quantity },
+        );
+      } else {
+        await manager.insert(Reservation, {
+          campaignId,
+          orderId: piece.orderId,
+          quantity: piece.quantity,
+        });
+      }
+    }
+  }
+
+  private async releaseNewestCredit(
+    manager: EntityManager,
+    books: Books,
+    campaignId: string,
+  ): Promise<void> {
+    const ordersById = new Map(books.orders.map((order) => [order.id, order]));
+    const newest = books.reservations
+      .filter((reservation) => reservation.campaignId === campaignId)
+      .sort((left, right) => {
+        const leftPlaced =
+          ordersById.get(left.orderId)?.placedAt.getTime() ?? 0;
+        const rightPlaced =
+          ordersById.get(right.orderId)?.placedAt.getTime() ?? 0;
+        return (
+          rightPlaced - leftPlaced || right.orderId.localeCompare(left.orderId)
+        );
+      })[0];
+    if (!newest) {
+      return;
+    }
+    if (newest.quantity === 1) {
+      await manager.delete(Reservation, {
+        campaignId,
+        orderId: newest.orderId,
+      });
+      return;
+    }
+    await manager.update(
+      Reservation,
+      { campaignId, orderId: newest.orderId },
+      { quantity: newest.quantity - 1 },
+    );
+  }
+
+  private async settle(
+    manager: EntityManager,
+    customerId: string,
+    cause?: { cancelledOrderId: string },
+  ): Promise<void> {
+    await this.coverCustomer(manager, customerId, cause);
     assertConservation(await this.loadBooks(manager, customerId));
+  }
+
+  private async coverCustomer(
+    manager: EntityManager,
+    customerId: string,
+    cause?: { cancelledOrderId: string },
+  ): Promise<void> {
+    const books = await this.loadBooks(manager, customerId);
+    const activeIds = new Set(
+      books.orders
+        .filter((order) => order.status === OrderStatus.ACTIVE)
+        .map((order) => order.id),
+    );
+    const ordersById = new Map(books.orders.map((order) => [order.id, order]));
+    const balance = projectBalance(books);
+    const plan = coverOutstanding({
+      lots: balance.orders
+        .filter((order) => order.status === OrderStatus.ACTIVE)
+        .map((order) => ({
+          orderId: order.id,
+          remaining: Math.max(
+            0,
+            order.quantity - order.reserved - order.consumed,
+          ),
+        })),
+      unbackedMessageIds: books.messages
+        .filter(
+          (message) =>
+            message.creditState === CreditState.RESERVED &&
+            (message.orderId === null || !activeIds.has(message.orderId)),
+        )
+        .map((message) => message.id)
+        .sort(),
+      shortfalls: books.campaigns
+        .filter((campaign) => campaign.status === CampaignStatus.SCHEDULED)
+        .map((campaign) => ({
+          campaign,
+          missing:
+            balance.campaigns.find((item) => item.id === campaign.id)
+              ?.shortfall ?? 0,
+        }))
+        .filter((item) => item.missing > 0)
+        .sort(
+          (left, right) =>
+            (left.campaign.scheduledAt?.getTime() ?? 0) -
+              (right.campaign.scheduledAt?.getTime() ?? 0) ||
+            left.campaign.id.localeCompare(right.campaign.id),
+        )
+        .map((item) => ({
+          campaignId: item.campaign.id,
+          missing: item.missing,
+        })),
+      debtMessageIds: books.messages
+        .filter((message) => {
+          if (message.creditState !== CreditState.CONSUMED) {
+            return false;
+          }
+          return message.orderId === null || !activeIds.has(message.orderId);
+        })
+        .sort((left, right) => {
+          const leftPlaced =
+            (left.orderId
+              ? ordersById.get(left.orderId)?.placedAt.getTime()
+              : undefined) ?? Number.MAX_SAFE_INTEGER;
+          const rightPlaced =
+            (right.orderId
+              ? ordersById.get(right.orderId)?.placedAt.getTime()
+              : undefined) ?? Number.MAX_SAFE_INTEGER;
+          return leftPlaced - rightPlaced || left.id.localeCompare(right.id);
+        })
+        .map((message) => message.id),
+    });
+
+    for (const assignment of plan.assignments) {
+      await manager.update(Message, assignment.messageId, {
+        orderId: assignment.orderId,
+      });
+    }
+    for (const add of plan.reservationAdds) {
+      const current = await manager.findOne(Reservation, {
+        where: { campaignId: add.campaignId, orderId: add.orderId },
+      });
+      if (current) {
+        await manager.update(
+          Reservation,
+          { campaignId: add.campaignId, orderId: add.orderId },
+          { quantity: current.quantity + add.quantity },
+        );
+      } else {
+        await manager.insert(Reservation, add);
+      }
+    }
+
+    const settled = projectBalance(await this.loadBooks(manager, customerId));
+    for (const campaign of settled.campaigns) {
+      if (campaign.status !== CampaignStatus.SCHEDULED) {
+        continue;
+      }
+      const source = books.campaigns.find((item) => item.id === campaign.id);
+      if (campaign.shortfall === 0 && source?.fundingNote) {
+        await manager.update(Campaign, campaign.id, { fundingNote: null });
+      } else if (campaign.shortfall > 0 && cause) {
+        await manager.update(Campaign, campaign.id, {
+          fundingNote: `Order ${cause.cancelledOrderId} was cancelled. Shortfall is ${campaign.shortfall} credit(s).`,
+        });
+      }
+    }
   }
 
   private async loadBooks(
@@ -292,6 +828,41 @@ function assertQuantity(quantity: number): void {
       'Order quantity must be a whole number from 1 to 1000000.',
     );
   }
+}
+
+function freeLots(balance: Balance): { orderId: string; remaining: number }[] {
+  return balance.orders
+    .filter((order) => order.status === OrderStatus.ACTIVE)
+    .map((order) => ({
+      orderId: order.id,
+      remaining: order.quantity - order.reserved - order.consumed,
+    }));
+}
+
+function insufficientCredit(balance: Balance): AccountingError {
+  return new AccountingError(
+    'INSUFFICIENT_CREDIT',
+    `Not enough credit: available ${balance.available}, reserved ${balance.reserved}, debt ${balance.debt}.`,
+  );
+}
+
+function toCampaignView(campaign: Campaign): CampaignView {
+  return {
+    id: campaign.id,
+    customerId: campaign.customerId,
+    status: campaign.status,
+    scheduledAt: campaign.scheduledAt,
+    fundingNote: campaign.fundingNote,
+    notSentReason: campaign.notSentReason,
+  };
+}
+
+function toRecipientView(recipient: Recipient): RecipientView {
+  return {
+    id: recipient.id,
+    campaignId: recipient.campaignId,
+    address: recipient.address,
+  };
 }
 
 function toOrderView(order: Order): OrderView {

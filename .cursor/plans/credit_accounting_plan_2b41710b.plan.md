@@ -10,7 +10,7 @@ todos:
     status: completed
   - id: pr3-campaigns
     content: "Task 3 of the same run, with no new user prompt: branch feat/campaign-reservations from feat/orders-and-balance. Campaigns, recipients, schedule, cancel schedule, FIFO reservations, cancellation shortfall, insufficient credit, and concurrent scheduling tests. Full suite, review, commit, push, and open the PR against feat/orders-and-balance."
-    status: pending
+    status: completed
   - id: pr4-send
     content: "Task 4 of the same run, with no new user prompt: branch feat/send-and-handoff from feat/campaign-reservations. sendDue, deterministic message assignment, handoff idempotency and bigint sequences, debt from cancellation and late accepts, and the priority proofs. Full suite, review, commit, push, and open the PR against feat/campaign-reservations. Report all four PR URLs, branches, commits, and validation results."
     status: pending
@@ -265,8 +265,8 @@ The orchestrator updates this table and the YAML `todos` together. `completed` m
 | Task | Branch | PR base | Commits | PR | Validation | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 Schema | `feat/accounting-schema` | `main` | `bb0f092`, `5161379`, `f400f47` (head `f400f47`, base `1aae9dd`) | https://github.com/liorale2310/messaging-balance/pull/2 | `npm run build` pass; `npm run lint` pass with the existing `src/main.ts` floating-promise warning; `npm test` 10 passed; `DB_NAME=messaging_balance_test npm run test:db` 8 passed | completed |
-| 2 Orders | `feat/orders-and-balance` | `feat/accounting-schema` | `4dfc19d`, `b051280` (head `b051280`, base `671f012`) | https://github.com/liorale2310/messaging-balance/pull/3 | `npm run build` pass; `npm run lint` pass with the existing `src/main.ts` floating-promise warning; `npm test` 13 passed; `DB_NAME=messaging_balance_test npm run test:db` 17 passed | completed |
-| 3 Campaigns | `feat/campaign-reservations` | `feat/orders-and-balance` | — | — | — | pending |
+| 2 Orders | `feat/orders-and-balance` | `feat/accounting-schema` | `4dfc19d`, `b051280`, `5ca7abc` (head `5ca7abc`, base `671f012`) | https://github.com/liorale2310/messaging-balance/pull/3 | `npm run build` pass; `npm run lint` pass with the existing `src/main.ts` floating-promise warning; `npm test` 13 passed; `DB_NAME=messaging_balance_test npm run test:db` 17 passed | completed |
+| 3 Campaigns | `feat/campaign-reservations` | `main` | `74cc0f5`, `abdc88a`, `10e955d`, `390d6f5` | https://github.com/liorale2310/messaging-balance/pull/4 | Suite on `74cc0f5`, whose tree `10e955d` restores: `npm run build` pass; `npm run lint` pass with the existing `src/main.ts` floating-promise warning; `npm test` 16 passed; `DB_NAME=messaging_balance_test npm run test:db` 23 passed. `abdc88a` landed on this branch and `10e955d` reverts it, so the file diff is the campaign work. | completed |
 | 4 Send | `feat/send-and-handoff` | `feat/campaign-reservations` | — | — | — | pending |
 
 ## Testing
