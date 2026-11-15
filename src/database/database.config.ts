@@ -1,6 +1,9 @@
 import { join } from 'node:path';
 import { TypeOrmModuleOptions } from '@nestjs/typeorm';
 import { DataSourceOptions } from 'typeorm';
+import { installBigintParser } from '../accounting/bigint';
+
+installBigintParser();
 
 function requiredEnv(key: string): string {
   const value = process.env[key];
