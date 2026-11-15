@@ -10,18 +10,22 @@ function requiredEnv(key: string): string {
   return value;
 }
 
+const DIGITS_ONLY = /^\d+$/;
+
+function invalidDatabasePort(value: string): Error {
+  return new Error(
+    `Invalid DB_PORT: "${value}". Expected an integer between 1 and 65535.`,
+  );
+}
+
 export function parseDatabasePort(value: string): number {
-  if (!/^[0-9]+$/.test(value)) {
-    throw new Error(
-      `Invalid DB_PORT: "${value}". Expected an integer between 1 and 65535.`,
-    );
+  if (!DIGITS_ONLY.test(value)) {
+    throw invalidDatabasePort(value);
   }
 
   const port = Number(value);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(
-      `Invalid DB_PORT: "${value}". Expected an integer between 1 and 65535.`,
-    );
+    throw invalidDatabasePort(value);
   }
 
   return port;

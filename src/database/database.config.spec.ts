@@ -20,6 +20,15 @@ describe('parseDatabasePort', () => {
     expect(() => parseDatabasePort('5432.5')).toThrow(
       'Invalid DB_PORT: "5432.5". Expected an integer between 1 and 65535.',
     );
+    expect(() => parseDatabasePort('5432.0')).toThrow(
+      'Invalid DB_PORT: "5432.0". Expected an integer between 1 and 65535.',
+    );
+  });
+
+  it('rejects scientific notation', () => {
+    expect(() => parseDatabasePort('5.432e3')).toThrow(
+      'Invalid DB_PORT: "5.432e3". Expected an integer between 1 and 65535.',
+    );
   });
 
   it('rejects ports outside 1–65535', () => {
